@@ -21,15 +21,6 @@ os.environ["TFHUB_CACHE_DIR"] = "/mnt/pccfs/not_backed_up/hub/"
 import tensorflow as tf
 import tensorflow_hub as hub
 
-#initialize sentence embeddings
-#g1 = tf.Graph()
-#with g1.as_default():
-#    #embed = hub.Module("https://tfhub.dev/google/universal-sentence-encoder/2")
-#    embed = hub.Module("https://tfhub.dev/google/universal-sentence-encoder-lite/2")
-
-#    session = tf.Session()
-#    session.run([tf.global_variables_initializer(), tf.tables_initializer()])
-
 #
 # ===============================================
 # ===============================================
@@ -43,7 +34,10 @@ dataset = Dataset()
 
 # experimental variables
 LOSS_METHOD = 'ELBO'
-INPUT_EMBEDDING = 'bag_of_words' #bag of words embedding using fastText
+
+#INPUT_EMBEDDING = 'bag_of_words' #bag of words embedding using fastText
+INPUT_EMBEDDING = 'self_trained' #learn task-specific sentence embeddings 
+
 WORD_EMBEDDING = 'FastText'
 USE_NEGATIONS = False
 
@@ -60,19 +54,25 @@ elif INPUT_EMBEDDING == 'use_lite':
     SENTENCE_EMBEDDING_SIZE = 512
     OUTER_LSTM_HIDDEN_SIZE = 512
     DECODER_HIDDEN_SIZE = 1024
-    Z_DIMENSION = 300 
+    Z_DIMENSION = 512
 elif INPUT_EMBEDDING == 'use_large':
     SENTENCE_EMBEDDING_SIZE = 512
     OUTER_LSTM_HIDDEN_SIZE = 512
     DECODER_HIDDEN_SIZE = 1024
+    Z_DIMENSION = 512
+elif INPUT_EMBEDDING == 'self_trained':
+    SENTENCE_EMBEDDING_SIZE = 300
+    OUTER_LSTM_HIDDEN_SIZE = 300
+    DECODER_HIDDEN_SIZE = 600
     Z_DIMENSION = 300 
+
 
 LEARNING_RATE = .0001
 MAX_LENGTH = 300
 NUM_LAYERS_FOR_RNNS = 1
 #CONTEXT_LENGTH = 5
 
-USE_CUDA = False
+USE_CUDA = True
 TEACHER_FORCING = True
 
 
@@ -253,10 +253,12 @@ class VRAE(nn.Module):
         # define rnns
         self.num_layers = num_layers_for_rnns
         self.outer_lstm_hidden_dim = outer_lstm_hidden_dim
-        #self.encoder_rnn = EncoderRNN(input_size=vocab_dim,
-        #                              hidden_size=encoder_hidden_dim,
-        #                              num_layers=self.num_layers,
-        #                              ftext = self.ftext)
+
+        if INPUT_EMBEDDING == 'self_trained':
+            self.encoder_rnn = EncoderRNN(input_size=vocab_dim,
+                                      hidden_size=sentence_embedding_size,
+                                      num_layers=self.num_layers,
+                                      ftext = self.ftext)
         
         self.outer_lstm_rnn = nn.GRU(sentence_embedding_size,
                                       outer_lstm_hidden_dim,
@@ -385,13 +387,29 @@ class VRAE(nn.Module):
     def guide(self, input_variable, target_variable, step):
         # register PyTorch module `encoder` with Pyro
         pyro.module("encoder_dense", self.encoder_dense)
-        #pyro.module("encoder_rnn", self.encoder_rnn)
+        if INPUT_EMBEDDING == 'self_trained':
+            pyro.module("encoder_rnn", self.encoder_rnn)
         pyro.module("outer_lstm_rnn", self.outer_lstm_rnn)
 
-        # Collect the last n sentence embeddings
-        #self.context.append(input_variable)
-        #if len(self.context) > CONTEXT_LENGTH:
-        #    self.context = self.context[1:]
+        if INPUT_EMBEDDING == 'self_trained':
+            # rather than using a pre-trained embedding layer,
+            # we will learn sentence embeddings specifically-suited
+            # to this one particular task.
+            input_length = input_variable.shape[0]
+            encoder_hidden = self.encoder_rnn.init_hidden_gru()
+
+            hidden_average = Variable(torch.zeros(self.num_layers, 1, self.encoder_rnn.hidden_size))
+            hidden_average = hidden_average.cuda() if USE_CUDA else hidden_average
+
+            # loop to encode, then average the successive hidden states
+            # to get the final sentence embedding
+            for ei in range(input_length):
+                encoder_output, encoder_hidden = self.encoder_rnn(
+                    input_variable[ei], encoder_hidden)
+                hidden_average += encoder_hidden
+            sentence_embedding = hidden_average/input_length
+        else:
+            sentence_embedding = input_variable
 
         # OUTER LSTM
         # recurrently encode each of the sentence embeddings
@@ -407,7 +425,7 @@ class VRAE(nn.Module):
         #print("HERE - vnrae guide")
         #print(input_variable.shape)
         #print(len(input_variable))
-        for i in range(len(input_variable)):
+        for i in range(len(sentence_embedding)):
             #print(i)
             #print(input_variable[i])
             #print(input_variable[i].shape)
@@ -468,27 +486,36 @@ for epoch in range(30):
         # the data loader gives us two sentences, but we
         # will discard the second and use only the first sentence
         next_sentence, _ = dataset.next_batch()
-
+        
         # generate target one_hot outputs for the input sentence
         y = f.get_indices(next_sentence)
         y_onehot = dataset.to_onehot(y, long_type=False)
 
-        # embed the input sentence
-        embedded_x = vrae.bag_of_words_embedding(next_sentence)
-        #if convo_i % 10 == 0:
-        #    print("Next sentence:", ' '.join(next_sentence))
-        
-        #for i in range(len(context)-1):
-        #    context[i] = context[i+1]
-        #context[-1] = embedded_sentence
-        #
-        #x = context
-
         # do ELBO gradient and accumulate loss
-        if USE_CUDA:
-            loss = svi.step(embedded_x.cuda().view(1,SENTENCE_EMBEDDING_SIZE), y_onehot.cuda(), convo_i)
+        if INPUT_EMBEDDING == 'self_trained':
+            x = f.get_indices(next_sentence)
+            x = dataset.to_onehot(x, long_type=False)
+            if USE_CUDA:
+                loss = svi.step(x.cuda(), y.cuda(), convo_i)
+            else:
+                loss = svi.step(x, y, convo_i)
+
+        elif INPUT_EMBEDDING == 'bag_of_words':
+            embedded_x = vrae.bag_of_words_embedding(next_sentence)
+            if USE_CUDA:
+                loss = svi.step(embedded_x.cuda().view(1,SENTENCE_EMBEDDING_SIZE), y_onehot.cuda(), convo_i)
+            else:
+                loss = svi.step(embedded_x.view(1,SENTENCE_EMBEDDING_SIZE), y_onehot, convo_i)
+
+        elif INPUT_EMBEDDING == 'use_lite':
+            pass
+
+        elif INPUT_EMBEDDING == 'use_large':
+            pass
+
         else:
-            loss = svi.step(embedded_x.view(1,SENTENCE_EMBEDDING_SIZE), y_onehot, convo_i)
+            raise ValueError("Error: invalid embedding type: " + INPUT_EMBEDDING)
+
         epoch_loss += loss
 
         # print loss
